@@ -955,6 +955,344 @@ app.get('/api/plans/:id/publications/:seq/image', wrap((req, res) => {
   }).pipe(res);
 }));
 
+/* --------------------------- 巡检轮次（发起 / 填写 / 完成） --------------------------- */
+
+const INSPECTION_RESULTS = ['正常', '隐患'];
+const ROUND_STATUS = { IN_PROGRESS: 'in_progress', COMPLETED: 'completed' };
+const NOTE_MAX_LEN = 2000;
+
+/** 从路径参数解析发布序号：正整数或 latest；latest 在该图纸无发布版时 404 */
+function resolvePubSeq(plan, raw) {
+  if (raw === 'latest') {
+    const latest = db.prepare('SELECT seq FROM publications WHERE plan_id = ? ORDER BY seq DESC LIMIT 1')
+      .get(plan.id);
+    if (!latest) {
+      throw new ApiError(404, 'NO_PUBLICATION', `图纸「${plan.name}」暂无巡检版，尚未发布过`);
+    }
+    return latest.seq;
+  }
+  const seq = Number(raw);
+  if (!Number.isInteger(seq) || seq < 1) {
+    throw new ApiError(400, 'VALIDATION_ERROR', '发布序号 seq 必须为正整数或 latest');
+  }
+  return seq;
+}
+
+function getRoundOr404(roundId) {
+  const row = db.prepare('SELECT * FROM inspection_rounds WHERE id = ?').get(roundId);
+  if (!row) {
+    throw new ApiError(404, 'ROUND_NOT_FOUND', `巡检轮次 id=${roundId} 不存在`);
+  }
+  return row;
+}
+
+function roundRecords(roundId) {
+  return db.prepare('SELECT region_code, result, note, updated_at FROM inspection_records WHERE round_id = ?')
+    .all(roundId);
+}
+
+/**
+ * 轮次详情：把逐区结果与冻结版区域顺序对齐；
+ * 未填写区 result=null（只读展示冻结内容，不改变冻结快照本身）。
+ */
+function roundJson(round, pub) {
+  const frozen = JSON.parse(pub.regions_json);
+  const byCode = new Map(roundRecords(round.id).map((r) => [r.region_code, r]));
+  const regions = frozen.map((r) => {
+    const rec = byCode.get(r.code) || null;
+    return {
+      code: r.code,
+      risk_level: r.risk_level,
+      vertices: r.vertices,
+      result: rec ? rec.result : null,
+      note: rec ? rec.note : '',
+      updated_at: rec ? rec.updated_at : null,
+    };
+  });
+  return {
+    id: round.id,
+    plan_id: round.plan_id,
+    publication_id: round.publication_id,
+    seq: round.seq,
+    status: round.status,
+    version: round.version,
+    plan_name: round.plan_name,
+    publication_seq: pub.seq,
+    plan_version: pub.plan_version,
+    width: pub.width,
+    height: pub.height,
+    region_count: round.total_regions,
+    filled_count: round.filled_regions,
+    hazard_count: round.hazard_count,
+    started_at: round.started_at,
+    completed_at: round.completed_at,
+    regions,
+  };
+}
+
+/** 列表摘要（不含逐区结果；列表与详情的详细逐区结果走轮次详情） */
+function roundSummary(row) {
+  return {
+    id: row.id,
+    plan_id: row.plan_id,
+    publication_id: row.publication_id,
+    publication_seq: row.pub_seq,
+    plan_name: row.plan_name,
+    seq: row.seq,
+    status: row.status,
+    version: row.version,
+    region_count: row.total_regions,
+    filled_count: row.filled_regions,
+    hazard_count: row.hazard_count,
+    started_at: row.started_at,
+    completed_at: row.completed_at,
+  };
+}
+
+/** 冲突响应中附带轮次最新完整状态，客户端不覆盖未提交内容、仅同步其他区 */
+function roundConflict(round, pub, code, message) {
+  return new ApiError(409, code, message, { server: { round: roundJson(round, pub) } });
+}
+
+function requireRoundVersion(body, round, pub) {
+  if (body.version == null) {
+    throw new ApiError(400, 'VALIDATION_ERROR', '必须携带所见轮次版本 version（正整数）');
+  }
+  const v = Number(body.version);
+  if (!Number.isInteger(v) || v < 1) {
+    throw new ApiError(400, 'VALIDATION_ERROR', '轮次版本 version 必须为正整数');
+  }
+  if (v !== round.version) {
+    throw roundConflict(round, pub, 'ROUND_VERSION_CONFLICT',
+      `该轮次已被其他人修改（你的所见版本 r${v}，当前版本 r${round.version}）。` +
+      `未提交的填写内容已保留，请对照最新状态后重试。`);
+  }
+  return v;
+}
+
+/**
+ * 发起一轮巡检（针对已发布的冻结巡检版）。
+ *  - 空区域巡检版（发布时 0 区）不可发起 → 400 EMPTY_PUBLICATION；
+ *  - 同一巡检版可发起多轮，轮次序号在版内从 1 递增；
+ *  - 轮次只引用冻结版，图纸/区域后续变化与本轮无关。
+ */
+app.post('/api/plans/:id/publications/:seq/rounds', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  const seq = resolvePubSeq(plan, req.params.seq);
+  const pub = getPublication(plan, seq);
+
+  if (pub.region_count < 1) {
+    throw new ApiError(400, 'EMPTY_PUBLICATION',
+      `第 ${pub.seq} 号巡检版发布时没有任何区域，空区域巡检版不可发起巡检`);
+  }
+
+  const roundId = db.transaction(() => {
+    const nextSeq = (db.prepare(
+      'SELECT COALESCE(MAX(seq), 0) + 1 AS s FROM inspection_rounds WHERE publication_id = ?'
+    ).get(pub.id)).s;
+    const info = db.prepare(`
+      INSERT INTO inspection_rounds
+        (plan_id, publication_id, seq, plan_name, status, total_regions)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(plan.id, pub.id, nextSeq, plan.name, ROUND_STATUS.IN_PROGRESS, pub.region_count);
+    return info.lastInsertRowid;
+  })();
+
+  const round = getRoundOr404(roundId);
+  res.status(201).json({
+    round: roundJson(round, pub),
+    message: `已针对第 ${pub.seq} 号巡检版发起第 ${round.seq} 轮巡检（共 ${pub.region_count} 个区域）`,
+  });
+}));
+
+// 某巡检版下的全部轮次（含每轮进度/隐患数）
+app.get('/api/plans/:id/publications/:seq/rounds', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  const seq = resolvePubSeq(plan, req.params.seq);
+  const pub = getPublication(plan, seq);
+  const rows = db.prepare(`
+    SELECT r.*, p.seq AS pub_seq
+    FROM inspection_rounds r JOIN publications p ON p.id = r.publication_id
+    WHERE r.publication_id = ? ORDER BY r.seq DESC
+  `).all(pub.id);
+  res.json({
+    plan_id: plan.id,
+    plan_name: plan.name,
+    publication_seq: pub.seq,
+    publication_id: pub.id,
+    region_count: pub.region_count,
+    count: rows.length,
+    rounds: rows.map(roundSummary),
+  });
+}));
+
+// 该图纸全部巡检版的轮次（查看历史轮次用，最新轮次在前）
+app.get('/api/plans/:id/rounds', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  const rows = db.prepare(`
+    SELECT r.*, p.seq AS pub_seq
+    FROM inspection_rounds r JOIN publications p ON p.id = r.publication_id
+    WHERE r.plan_id = ? ORDER BY r.id DESC
+  `).all(plan.id);
+  res.json({
+    plan_id: plan.id,
+    plan_name: plan.name,
+    count: rows.length,
+    rounds: rows.map(roundSummary),
+  });
+}));
+
+// 轮次详情：所属图纸/发布序号/进度 + 每区结果（未填写区 result=null）
+app.get('/api/rounds/:rid', wrap((req, res) => {
+  const roundId = Number(req.params.rid);
+  if (!Number.isInteger(roundId) || roundId < 1) {
+    throw new ApiError(400, 'VALIDATION_ERROR', '轮次 id 必须为正整数');
+  }
+  const round = getRoundOr404(roundId);
+  const pub = db.prepare('SELECT * FROM publications WHERE id = ?').get(round.publication_id);
+  res.json({ round: roundJson(round, pub) });
+}));
+
+/** 校验单条逐区提交：结论合法、编号属冻结版、隐患必须有非空备注。任何不过即整体拒绝。 */
+function validateRoundEntry(body, frozenCodes) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new ApiError(400, 'VALIDATION_ERROR', '请求体必须是 JSON 对象');
+  }
+  const code = String(body.region_code == null ? '' : body.region_code).trim();
+  if (!code) {
+    throw new ApiError(400, 'VALIDATION_ERROR', '缺少区域编号 region_code');
+  }
+  if (!frozenCodes.has(code)) {
+    throw new ApiError(404, 'UNKNOWN_REGION',
+      `区域编号「${code}」不属于该巡检版冻结的区域，已拒绝且未保存任何内容`);
+  }
+  const result = String(body.result == null ? '' : body.result).trim();
+  if (!INSPECTION_RESULTS.includes(result)) {
+    throw new ApiError(400, 'VALIDATION_ERROR',
+      `巡检结论非法：${result === '' ? '（空）' : `「${result}」`}，必须是：${INSPECTION_RESULTS.join(' / ')}`);
+  }
+  const note = String(body.note == null ? '' : body.note).trim();
+  if (note.length > NOTE_MAX_LEN) {
+    throw new ApiError(400, 'VALIDATION_ERROR', `备注不能超过 ${NOTE_MAX_LEN} 个字符`);
+  }
+  if (result === '隐患' && !note) {
+    throw new ApiError(400, 'HAZARD_NOTE_REQUIRED',
+      `区域「${code}」的结论为隐患，必须填写非空备注（隐患描述/位置/处理建议）`);
+  }
+  return { code, result, note };
+}
+
+/**
+ * 逐区保存「正常/隐患」+ 备注（UPSERT，单区粒度提交）。
+ *  - 必须携带所见轮次版本 version：他人先修改 → 409 ROUND_VERSION_CONFLICT，
+ *    响应附轮次最新状态，本次提交整体拒绝，不覆盖未提交内容；
+ *  - 已完成轮次只读 → 409 ROUND_CLOSED；
+ *  - 未知区域编号 / 非法结论 / 隐患无备注 → 404/400，不留下半成品。
+ */
+app.put('/api/rounds/:rid/records', wrap((req, res) => {
+  const roundId = Number(req.params.rid);
+  if (!Number.isInteger(roundId) || roundId < 1) {
+    throw new ApiError(400, 'VALIDATION_ERROR', '轮次 id 必须为正整数');
+  }
+  const round = getRoundOr404(roundId);
+  const pub = db.prepare('SELECT * FROM publications WHERE id = ?').get(round.publication_id);
+  if (!pub) throw new ApiError(410, 'PUBLICATION_MISSING', '该轮次关联的巡检版已不存在');
+
+  if (round.status === ROUND_STATUS.COMPLETED) {
+    throw roundConflict(round, pub, 'ROUND_CLOSED',
+      `第 ${round.seq} 轮巡检已完成（完成于 ${round.completed_at || ''}），轮次与结果只读，不可再修改`);
+  }
+
+  const frozen = JSON.parse(pub.regions_json);
+  const entry = validateRoundEntry(req.body, new Set(frozen.map((r) => r.code)));
+  requireRoundVersion(req.body || {}, round, pub);
+
+  db.transaction(() => {
+    // 事务内二次确认，挡住检查之后、写入之前的并发提交/完成
+    const cur = db.prepare('SELECT * FROM inspection_rounds WHERE id = ?').get(round.id);
+    if (cur.status === ROUND_STATUS.COMPLETED) {
+      throw roundConflict(cur, pub, 'ROUND_CLOSED',
+        `第 ${cur.seq} 轮巡检在你提交前已完成，结果只读，本次保存已拒绝`);
+    }
+    if (cur.version !== round.version) {
+      throw roundConflict(cur, pub, 'ROUND_VERSION_CONFLICT',
+        `该轮次在你提交前已被其他人更新（r${round.version} → r${cur.version}），` +
+        `本次保存已拒绝，未提交内容不会被覆盖。`);
+    }
+    db.prepare(`
+      INSERT INTO inspection_records (round_id, region_code, result, note, updated_at)
+      VALUES (@rid, @code, @result, @note, datetime('now'))
+      ON CONFLICT(round_id, region_code) DO UPDATE SET
+        result = excluded.result, note = excluded.note, updated_at = datetime('now')
+    `).run({ rid: round.id, code: entry.code, result: entry.result, note: entry.note });
+
+    const agg = db.prepare(`
+      SELECT COUNT(*) AS filled,
+             SUM(CASE WHEN result = '隐患' THEN 1 ELSE 0 END) AS hazards
+      FROM inspection_records WHERE round_id = ?
+    `).get(round.id);
+    db.prepare(`
+      UPDATE inspection_rounds
+      SET filled_regions = ?, hazard_count = ?, version = version + 1
+      WHERE id = ?
+    `).run(agg.filled, agg.hazards || 0, round.id);
+  })();
+
+  const fresh = getRoundOr404(round.id);
+  res.json({ round: roundJson(fresh, pub) });
+}));
+
+/**
+ * 完成巡检：
+ *  - 必须携带所见轮次版本；冲突/已完成 → 409 并附最新状态；
+ *  - 只有冻结版全部区域都有记录才允许完成，否则 409 ROUND_INCOMPLETE（列出未填编号）；
+ *  - 完成后 status=completed、completed_at 落定，轮次及结果永久只读。
+ */
+app.post('/api/rounds/:rid/complete', wrap((req, res) => {
+  const roundId = Number(req.params.rid);
+  if (!Number.isInteger(roundId) || roundId < 1) {
+    throw new ApiError(400, 'VALIDATION_ERROR', '轮次 id 必须为正整数');
+  }
+  const round = getRoundOr404(roundId);
+  const pub = db.prepare('SELECT * FROM publications WHERE id = ?').get(round.publication_id);
+  if (!pub) throw new ApiError(410, 'PUBLICATION_MISSING', '该轮次关联的巡检版已不存在');
+
+  requireRoundVersion(req.body || {}, round, pub);
+
+  db.transaction(() => {
+    const cur = db.prepare('SELECT * FROM inspection_rounds WHERE id = ?').get(round.id);
+    if (cur.status === ROUND_STATUS.COMPLETED) {
+      throw roundConflict(cur, pub, 'ROUND_CLOSED',
+        `第 ${cur.seq} 轮巡检已完成（完成于 ${cur.completed_at || ''}），不可重复完成`);
+    }
+    if (cur.version !== round.version) {
+      throw roundConflict(cur, pub, 'ROUND_VERSION_CONFLICT',
+        `该轮次在你完成前已被其他人更新（r${round.version} → r${cur.version}），` +
+        `本次完成请求已拒绝，请核对最新结果后再完成。`);
+    }
+    const frozenCodes = JSON.parse(pub.regions_json).map((r) => r.code);
+    const filled = new Set(roundRecords(round.id).map((r) => r.region_code));
+    const missing = frozenCodes.filter((c) => !filled.has(c));
+    if (missing.length) {
+      throw roundConflict(cur, pub, 'ROUND_INCOMPLETE',
+        `还有 ${missing.length} 个区域未填写巡检结果（${missing.slice(0, 10).join('、')}` +
+        `${missing.length > 10 ? ' …' : ''}），全部区域记录齐全后才允许完成`,
+      );
+    }
+    db.prepare(`
+      UPDATE inspection_rounds
+      SET status = ?, completed_at = datetime('now'), version = version + 1
+      WHERE id = ?
+    `).run(ROUND_STATUS.COMPLETED, round.id);
+  })();
+
+  const fresh = getRoundOr404(round.id);
+  res.json({
+    round: roundJson(fresh, pub),
+    message: `第 ${fresh.seq} 轮巡检已完成（${fresh.total_regions} 区，隐患 ${fresh.hazard_count} 处），结果已锁定为只读`,
+  });
+}));
+
 /* ------------------------------- 错误处理 ------------------------------- */
 
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars

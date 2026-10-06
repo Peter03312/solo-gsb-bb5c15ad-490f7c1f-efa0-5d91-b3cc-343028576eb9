@@ -38,8 +38,37 @@
         <ul id="inspRegionList" class="region-list"></ul>
       </div>
 
+      <div class="panel-section inspector-rounds" id="roundsPanel">
+        <div class="rounds-head">
+          <h3>巡检轮次 <span id="roundsCount" class="muted"></span></h3>
+          <button class="btn primary btn-sm" id="btnStartRound">▶ 发起一轮巡检</button>
+        </div>
+        <p class="hint" id="roundsHint">针对当前冻结的巡检版逐区填写「正常/隐患」；同一巡检版可发起多轮。</p>
+
+        <!-- 当前打开的轮次工作区 -->
+        <div id="roundWorkspace" class="round-workspace hidden">
+          <div class="round-ws-head">
+            <span id="roundWsTitle"></span>
+            <button class="btn btn-sm" id="btnExitRound">退出填写</button>
+          </div>
+          <div class="meta-row" id="roundWsBadges"></div>
+          <p class="round-status-msg" id="roundWsStatus"></p>
+          <ul id="roundEntryList" class="round-entry-list"></ul>
+          <div class="btn-row">
+            <button class="btn primary" id="btnCompleteRound">✓ 完成本轮巡检</button>
+          </div>
+          <p class="hint">隐患必须填写非空备注；全部区域记录齐全后才能完成。完成后轮次只读。</p>
+        </div>
+
+        <ul id="roundList" class="round-list"></ul>
+        <p class="pub-empty hidden" id="roundEmpty"></p>
+        <div class="round-history">
+          <button class="btn btn-sm wide" id="btnAllRounds">查看该图纸全部历史轮次</button>
+        </div>
+      </div>
+
       <div class="panel-section">
-        <p class="hint">巡检页仅展示发布时冻结的内容；无任何编辑、删除入口。</p>
+        <p class="hint">巡检页仅展示发布时冻结的内容；无任何编辑区域入口。</p>
         <a class="btn wide" href="/">← 返回应用首页</a>
       </div>
     </aside>
@@ -64,6 +93,7 @@
           <a class="btn primary" href="/">返回应用首页</a>
         </div>
       </div>
+      <div id="roundBanner" class="banner hidden"></div>
     </div>
   </main>
 

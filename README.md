@@ -64,7 +64,7 @@ npm start
 运行测试：
 
 ```bash
-npm test            # 几何校验单元测试（17 项）+ 巡检版发布端到端测试（15 项）
+npm test            # 几何校验单元测试（17 项）+ 巡检版发布端到端（15 项）+ 巡检轮次端到端（17 项）
 ```
 
 ---
@@ -114,7 +114,19 @@ data/
    即把当前**所见图纸版本**的原图与全部未删除区域（编号、风险等级、原图坐标）冻结为一个巡检版。
    - 发布后在面板中得到按序号排列的历史版本，点「查看」打开只读巡检页
      （`/inspector.html?plan=<图纸ID>&seq=<发布序号>`，`seq` 省略即为最新版），
-     可把链接直接发给巡检人员；页面只有缩放/平移与版本切换，没有任何编辑入口。
+     可把链接直接发给巡检人员；页面只有缩放/平移与版本切换，没有任何编辑区域入口。
+   - **发起巡检轮次**：巡检人员在只读巡检页下方「巡检轮次」面板点 **▶ 发起一轮巡检**，
+     即针对该版**冻结的区域编号**逐区填写「正常 / 隐患」+ 备注（隐患必须有非空备注），
+     每区单独保存；全部区域记录齐全后点「完成本轮巡检」。
+     - 同一巡检版可开展**多轮**，列表显示每轮的发布序号、巡检进度、隐患数与状态；
+       打开轮次可见所属图纸、发布序号与每区结果，完成的轮次在图上以绿/红着色。
+     - 巡检页面可直接查看**历史轮次**（含其他发布版上的轮次），
+       也可用深链 `/inspector.html?plan=<图纸ID>&round=<轮次ID>` 直接打开某一轮。
+     - 保存/完成均携带所见**轮次版本**：他人先修改时收到 **409 冲突**并附最新状态，
+       页面保留你未提交的输入、绝不覆盖；未全部填写不可完成；
+       **空区域巡检版不可发起**。
+     - 轮次完成后即只读：之后图纸改名、换图、区域编辑或发布新版，
+       都不改变旧轮次关联的冻结区域与结果。
    - 列表页与编辑器面板在未发布时明确提示「暂无巡检版」。
    - 发布请求携带所见图纸版本：期间图纸被改动会收到 **409 版本冲突**，不留下任何半成品快照；
      同一图纸版本重复发布为幂等操作，不会产生重复巡检版。
@@ -173,6 +185,31 @@ data/
 - **未发布提示**：从未发布时，列表接口返回 `count: 0 / latest_seq: null`，
   `latest` 与任意序号详情返回 **404 `NO_PUBLICATION`**，巡检页显示「暂无巡检版」。
 
+### 巡检轮次（针对已发布冻结版逐区巡检）
+
+- **发起**：巡检人员在只读巡检页（或调用 API）对某个发布序号发起轮次；
+  轮次只引用该巡检版记录（冻结区域编号/风险等级/原图坐标 + 快照原图）。
+  **空区域巡检版（发布时 0 区）不可发起** → **400 `EMPTY_PUBLICATION`**。
+- **多轮与序号**：同一巡检版可发起任意多轮，轮次序号在**版内**从 1 递增，互不影响。
+- **逐区填写**：按冻结版区域编号逐区保存结论 `正常` / `隐患` 与备注（单区 UPSERT）。
+  - 未知区域编号 → **404 `UNKNOWN_REGION`**；结论非法（缺失/非「正常/隐患」）→
+    **400 `VALIDATION_ERROR`**；**隐患备注为空（含纯空白）→ 400 `HAZARD_NOTE_REQUIRED`**；
+    所有拒绝都在任何写入之前，**不留下半成品**。
+  - 「正常」备注可留空；备注最长 2000 字。
+- **轮次乐观锁**：每次保存、完成都必须携带所见轮次版本 `version`（初始 1，每次写入 +1）。
+  - 轮次已被他人更新 → **409 `ROUND_VERSION_CONFLICT`**，响应附服务端最新完整轮次；
+    页面同步其他区域，**未提交的填写原样保留在表单中**，不被覆盖。
+  - 缺失/非法 `version` → **400**。
+- **完成条件**：只有冻结版**全部区域都有记录**才允许完成；否则 →
+  **409 `ROUND_INCOMPLETE`**，响应列出未填写编号。完成后 `status=completed`、
+  `completed_at` 落定；再保存或重复完成 → **409 `ROUND_CLOSED`**。
+- **完成后只读与冻结保证**：完成的轮次永久只读。轮次详情始终 JOIN 回当时的发布记录，
+  因此之后图纸改名、同尺寸换图、区域增删改、重新发布新版，
+  **都不改变旧轮次关联的冻结区域与每区结果**。
+- **列表与详情**：列表（版内 / 全图纸）给出所属图纸、发布序号、轮次序号、状态、
+  进度（`filled_count/region_count`）、隐患数与时间；详情额外给出与冻结区域顺序对齐的
+  逐区结果（未填写区 `result: null`）。轮次不存在 → **404 `ROUND_NOT_FOUND`**。
+
 ### 导出 / 导入的一致性与原子性
 
 - 导出保留：原图、`width/height` 尺寸、全部区域（编号、风险等级、顶点原图坐标）、
@@ -204,7 +241,13 @@ data/
 | `GET` | `/api/plans/:id/publications/latest` | 最新巡检版完整快照（未发布 → 404 `NO_PUBLICATION`） |
 | `GET` | `/api/plans/:id/publications/:seq` | 按发布序号查看旧版完整快照 |
 | `GET` | `/api/plans/:id/publications/:seq/image` | 该巡检版冻结原图（`:seq` 可为 `latest`） |
-| 页面 | `/inspector.html?plan=<id>[&seq=<序号>]` | 只读巡检页（省略 `seq` 看最新版） |
+| `POST` | `/api/plans/:id/publications/:seq/rounds` | 对某巡检版发起一轮巡检（`:seq` 可为 `latest`；空区域版 400） |
+| `GET` | `/api/plans/:id/publications/:seq/rounds` | 该巡检版的轮次列表（进度/隐患数/状态，最新在前） |
+| `GET` | `/api/plans/:id/rounds` | 该图纸全部发布版的历史轮次 |
+| `GET` | `/api/rounds/:rid` | 轮次详情（所属图纸/发布序号/进度 + 每区结果） |
+| `PUT` | `/api/rounds/:rid/records` | 保存某区结果（`region_code`,`result`,`note`,`version`；UPSERT） |
+| `POST` | `/api/rounds/:rid/complete` | 完成轮次（body 带 `version`；全部区域齐全才允许） |
+| 页面 | `/inspector.html?plan=<id>[&seq=<序号>][&round=<轮次ID>]` | 只读巡检页：查看版本、发起/填写轮次、查看历史轮次 |
 
 顶点坐标格式：`vertices: [{"x": 120.5, "y": 88}, ...]`，均为**原图像素坐标**。
 错误响应统一为：`{"error":"CODE","message":"中文原因", ...}`，冲突/删除响应另带 `server` 最新快照。
@@ -247,6 +290,65 @@ curl -o pub1.png http://localhost:8080/api/plans/1/publications/1/image
 # 4) 未发布时 → 404 {"error":"NO_PUBLICATION", "message":"图纸「…」暂无巡检版，尚未发布过"}
 ```
 
+### 巡检轮次调用示例（curl）
+
+```bash
+# 1) 发起一轮巡检（针对第 1 号巡检版；也可用 latest）
+curl -X POST http://localhost:8080/api/plans/1/publications/1/rounds
+# 201 {"round":{"id":7,"seq":1,"status":"in_progress","version":1,
+#   "publication_seq":1,"region_count":2,"filled_count":0,"hazard_count":0,
+#   "regions":[{"code":"A-01","result":null,"note":"",...}, ...]}}
+# 空区域巡检版 → 400 EMPTY_PUBLICATION；未发布版 → 404 NO_PUBLICATION
+
+# 2) 逐区保存（必须带所见轮次版本 version；隐患必须有非空备注）
+curl -X PUT http://localhost:8080/api/rounds/7/records \
+  -H 'Content-Type: application/json' \
+  -d '{"region_code":"A-01","result":"正常","note":"","version":1}'
+# 200 {"round":{... "version":2,"filled_count":1 ...}}
+curl -X PUT http://localhost:8080/api/rounds/7/records \
+  -H 'Content-Type: application/json' \
+  -d '{"region_code":"B-02","result":"隐患","note":"安全出口堆物，需立即清理","version":2}'
+# 常见拒绝：未知编号 404 UNKNOWN_REGION；非法结论 400；
+#           隐患无备注 400 HAZARD_NOTE_REQUIRED；他人先改 409 ROUND_VERSION_CONFLICT（附 server.round 最新状态）
+
+# 3) 未全部填写时完成 → 409 ROUND_INCOMPLETE（server.round 中可查未填区）
+curl -X POST http://localhost:8080/api/rounds/7/complete \
+  -H 'Content-Type: application/json' -d '{"version":3}'
+
+# 4) 全部保存后完成（version 用最新轮次版本）
+curl -X POST http://localhost:8080/api/rounds/7/complete \
+  -H 'Content-Type: application/json' -d '{"version":4}'
+# 200 {"round":{"status":"completed","completed_at":"...",...}}
+# 完成后再保存/再完成 → 409 ROUND_CLOSED
+
+# 5) 查看：版内轮次列表 / 图纸全部历史轮次 / 轮次详情
+curl http://localhost:8080/api/plans/1/publications/1/rounds
+curl http://localhost:8080/api/plans/1/rounds
+curl http://localhost:8080/api/rounds/7
+# 浏览器直接进入某轮： http://localhost:8080/inspector.html?plan=1&round=7
+```
+
+轮次详情 JSON 形如（逐区结果与冻结区域顺序对齐，未填写区 `result:null`）：
+
+```json
+{
+  "round": {
+    "id": 7, "plan_id": 1, "publication_id": 3, "publication_seq": 1, "seq": 2,
+    "plan_name": "1号馆", "status": "completed", "version": 5,
+    "region_count": 2, "filled_count": 2, "hazard_count": 1,
+    "started_at": "2026-10-06 03:10:00", "completed_at": "2026-10-06 03:42:11",
+    "regions": [
+      { "code": "A-01", "risk_level": "低风险", "result": "正常", "note": "",
+        "vertices": [{"x":10,"y":10}, {"x":80,"y":10}, {"x":80,"y":80}, {"x":10,"y":80}],
+        "updated_at": "2026-10-06 03:20:01" },
+      { "code": "B-02", "risk_level": "高风险", "result": "隐患", "note": "安全出口堆物",
+        "vertices": [{"x":100,"y":100}, {"x":140,"y":100}, {"x":140,"y":140}, {"x":100,"y":140}],
+        "updated_at": "2026-10-06 03:21:44" }
+    ]
+  }
+}
+```
+
 ---
 
 ## 七、目录结构
@@ -258,7 +360,7 @@ curl -o pub1.png http://localhost:8080/api/plans/1/publications/1/image
 ├── docker/entrypoint.sh       # 容器入口：先迁移数据库再启动
 ├── package.json
 ├── server/
-│   ├── app.js                 # Express 路由、事务、版本/冲突、导出导入、巡检版发布
+│   ├── app.js                 # Express 路由、事务、版本/冲突、导出导入、巡检版发布、巡检轮次
 │   ├── config.js              # 环境变量配置
 │   ├── db.js                  # SQLite 初始化 / 建表（可独立 npm run migrate）
 │   └── image.js               # 纯 Node 解析 PNG/JPEG 尺寸与损坏检测
@@ -266,13 +368,14 @@ curl -o pub1.png http://localhost:8080/api/plans/1/publications/1/image
 │   └── geometry.js            # 自交/越界/重叠校验（前后端共用）
 ├── public/
 │   ├── index.html             # 单页界面（列表 + SVG 编辑器 + 发布面板）
-│   ├── inspector.html         # 只读巡检页（按发布序号查看旧版/最新版）
-│   ├── inspector.js           # 巡检页：冻结快照渲染 + 缩放/平移/版本切换
+│   ├── inspector.html         # 只读巡检页（版本切换 + 巡检轮次面板）
+│   ├── inspector.js           # 巡检页：冻结快照渲染、缩放/平移、轮次填写/冲突保留/历史
 │   ├── styles.css
 │   └── app.js                 # 缩放/平移/绘制/冲突保留/轮询协作/发布交互
 └── tests/
     ├── geometry.test.js       # 几何规则单元测试
-    └── publications.test.js   # 巡检版发布/幂等/冲突/冻结不变性 端到端测试
+    ├── publications.test.js   # 巡检版发布/幂等/冲突/冻结不变性 端到端测试
+    └── rounds.test.js         # 巡检轮次发起/填写/冲突/完成/只读/冻结不变性 端到端测试
 ```
 
 ## 八、常见问题

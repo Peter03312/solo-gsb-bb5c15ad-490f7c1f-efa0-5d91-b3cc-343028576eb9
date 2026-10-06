@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node server/app.js",
     "migrate": "node server/db.js",
-    "test": "node tests/geometry.test.js && node tests/publications.test.js"
+    "test": "node tests/geometry.test.js && node tests/publications.test.js && node tests/rounds.test.js"
   },
   "engines": {
     "node": ">=20"

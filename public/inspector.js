@@ -21,6 +21,17 @@ const state = {
   pub: null,
   transform: { scale: 1, tx: 0, ty: 0 },
   drag: null,
+  // 巡检轮次
+  rounds: [],            // 当前冻结版的轮次摘要
+  activeRound: null,     // 打开中的轮次详情（逐区填写/只读查看）
+  dirty: new Set(),      // 有未保存输入的区域编号（冲突/轮询时绝不覆盖）
+  busy: false,           // 保存/完成请求进行中（暂停轮询）
+  pollTimer: null,
+};
+
+const RESULT_COLORS = {
+  '正常': { fill: 'rgba(22,163,74,.22)', stroke: '#15803d' },
+  '隐患': { fill: 'rgba(220,38,38,.28)', stroke: '#b91c1c' },
 };
 
 function esc(s) {
@@ -99,6 +110,13 @@ async function init() {
     } else {
       showEmpty(err.message, true);
     }
+    return;
+  }
+
+  // 深链：?round=<轮次id> 直接打开指定轮次（可为其他发布版的历史轮次）
+  const wantRound = query.get('round');
+  if (wantRound && /^\d+$/.test(wantRound)) {
+    openRound(Number(wantRound)).catch((err) => toast2(err.message, true));
   }
 }
 
@@ -114,8 +132,18 @@ function buildSwitcher(list) {
   }
   sel.addEventListener('change', () => {
     const s = Number(sel.value);
+    if (state.dirty.size &&
+        !confirm('当前轮次有未保存的填写内容，切换巡检版不会自动保存，确定切换吗？')) {
+      sel.value = String(state.currentSeq);
+      return;
+    }
+    stopPolling();
+    state.activeRound = null;
+    state.dirty = new Set();
+    setBanner('');
     const url = new URL(location.href);
     url.searchParams.set('seq', s);
+    url.searchParams.delete('round');
     history.replaceState(null, '', url);
     loadPublication(s).catch((err) => showEmpty(err.message, err.code !== 'NO_PUBLICATION'));
   });
@@ -149,6 +177,7 @@ async function loadPublication(seq) {
   renderRegions(pub);
   renderRegionList(pub);
   fitView();
+  await loadRounds();
 }
 
 function renderImage(pub) {
@@ -165,8 +194,21 @@ function renderImage(pub) {
 function renderRegions(pub) {
   const layer = $('inspRegionLayer');
   layer.innerHTML = '';
+  // 打开轮次时，按逐区结论覆盖填色（正常=绿，隐患=红，未填=冻结原色）
+  const byCode = state.activeRound
+    ? new Map(state.activeRound.regions.map((r) => [r.code, r]))
+    : null;
   for (const r of pub.regions) {
-    const c = RISK_COLORS[r.risk_level] || { fill: 'rgba(107,114,128,.15)', stroke: '#6b7280' };
+    const base = RISK_COLORS[r.risk_level] || { fill: 'rgba(107,114,128,.15)', stroke: '#6b7280' };
+    let c = base;
+    let suffix = '';
+    if (byCode) {
+      const rec = byCode.get(r.code);
+      if (rec && rec.result) {
+        c = RESULT_COLORS[rec.result] || c;
+        suffix = ` · ${rec.result}`;
+      }
+    }
     const poly = document.createElementNS(SVGNS, 'polygon');
     poly.setAttribute('points', pointsStr(r.vertices));
     poly.setAttribute('fill', c.fill);
@@ -181,7 +223,7 @@ function renderRegions(pub) {
     label.setAttribute('text-anchor', 'middle');
     label.setAttribute('dominant-baseline', 'central');
     label.setAttribute('class', 'poly-label');
-    label.textContent = `${r.code} · ${r.risk_level}`;
+    label.textContent = `${r.code} · ${r.risk_level}${suffix}`;
     layer.appendChild(label);
   }
 }
@@ -268,5 +310,496 @@ window.addEventListener('mouseup', () => {
 });
 svg.addEventListener('dblclick', fitView);
 window.addEventListener('resize', () => state.pub && applyTransform());
+
+/* ====================== 巡检轮次：发起 / 逐区填写 / 完成 / 历史 ====================== */
+
+function toast2(message, isError, ms = 3800) {
+  let box = $('inspToasts');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'inspToasts';
+    box.className = 'toasts';
+    document.body.appendChild(box);
+  }
+  const el = document.createElement('div');
+  el.className = `toast ${isError ? 'err' : 'ok'}`;
+  el.textContent = message;
+  box.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; }, ms);
+  setTimeout(() => el.remove(), ms + 400);
+}
+
+function setBanner(html, isError, actionsHtml) {
+  const b = $('roundBanner');
+  if (!html) { b.classList.add('hidden'); b.innerHTML = ''; return; }
+  b.classList.remove('hidden');
+  b.classList.toggle('banner-error', !!isError);
+  b.innerHTML = html + (actionsHtml ? `<div class="banner-actions">${actionsHtml}</div>` : '');
+}
+
+const statusText = (s) => (s === 'completed'
+  ? '已完成（只读）' : '进行中');
+
+/* ------------------------------- 轮次列表 ------------------------------- */
+
+async function loadRounds() {
+  if (!state.pub) return;
+  let data;
+  try {
+    data = await apiGet(`/api/plans/${planId}/publications/${state.pub.seq}/rounds`);
+  } catch (err) {
+    $('roundsHint').textContent = '轮次列表加载失败：' + err.message;
+    return;
+  }
+  state.rounds = data.rounds || [];
+  renderRoundsList();
+
+  const startBtn = $('btnStartRound');
+  if (state.pub.region_count < 1) {
+    startBtn.disabled = true;
+    startBtn.title = '该巡检版冻结时没有任何区域，空区域巡检版不可发起巡检';
+    $('roundsHint').textContent = '该巡检版冻结时没有任何区域，不可发起巡检。';
+  } else {
+    startBtn.disabled = false;
+    startBtn.title = '';
+  }
+
+  // 若打开的轮次属于当前版，同步其摘要状态
+  if (state.activeRound) {
+    const sum = state.rounds.find((r) => r.id === state.activeRound.id);
+    if (sum && sum.status === 'completed' && state.activeRound.status !== 'completed') {
+      // 他人刚完成：拉取最新只读详情
+      refreshActiveRound();
+    }
+  }
+}
+
+function renderRoundsList() {
+  const ul = $('roundList');
+  const empty = $('roundEmpty');
+  ul.innerHTML = '';
+  $('roundsCount').textContent = state.rounds.length ? `（${state.rounds.length} 轮）` : '';
+  empty.classList.toggle('hidden', state.rounds.length > 0);
+  empty.textContent = '本版还没有巡检轮次，点击「发起一轮巡检」开始。';
+  for (const r of state.rounds) {
+    const li = document.createElement('li');
+    const active = state.activeRound && state.activeRound.id === r.id;
+    if (active) li.classList.add('active');
+    const pct = r.region_count ? Math.round(r.filled_count / r.region_count * 100) : 0;
+    li.innerHTML = `
+      <span class="round-seq">第 ${r.seq} 轮</span>
+      <span class="round-info">
+        <span class="round-state ${r.status}">${statusText(r.status)}</span>
+        <span class="muted">${r.filled_count}/${r.region_count} 区 · 隐患 ${r.hazard_count}</span>
+        <span class="progress"><span class="progress-bar" style="width:${pct}%"></span></span>
+        <span class="pub-meta">${esc(r.started_at || '')}${r.completed_at ? ' · 完成 ' + esc(r.completed_at) : ''}</span>
+      </span>
+      <span class="pub-actions"></span>`;
+    const actions = li.querySelector('.pub-actions');
+    const openBtn = document.createElement('button');
+    openBtn.className = 'btn';
+    openBtn.textContent = r.status === 'completed' ? '查看结果' : (active ? '填写中' : '继续填写');
+    openBtn.disabled = !!active;
+    openBtn.onclick = () => openRound(r.id);
+    actions.appendChild(openBtn);
+    ul.appendChild(li);
+  }
+}
+
+/* ------------------------------- 发起轮次 ------------------------------- */
+
+$('btnStartRound').addEventListener('click', async () => {
+  if (!state.pub || state.pub.region_count < 1) return;
+  if (state.dirty.size &&
+      !confirm('当前轮次有未保存内容，发起新一轮不会自动保存，确定吗？')) return;
+  const btn = $('btnStartRound');
+  btn.disabled = true;
+  try {
+    const data = await apiSend('POST',
+      `/api/plans/${planId}/publications/${state.pub.seq}/rounds`);
+    toast2(data.message || '已发起新一轮巡检');
+    await loadRounds();
+    await openRound(data.round.id);
+  } catch (err) {
+    toast2(err.message, true, 6000);
+  } finally {
+    btn.disabled = state.pub && state.pub.region_count < 1;
+  }
+});
+
+$('btnExitRound').addEventListener('click', () => exitRound(true));
+
+$('btnAllRounds').addEventListener('click', async () => {
+  let data;
+  try {
+    data = await apiGet(`/api/plans/${planId}/rounds`);
+  } catch (err) { toast2(err.message, true); return; }
+  if (!data.count) { toast2('该图纸所有巡检版都还没有巡检轮次'); return; }
+  const lines = data.rounds.map((r) =>
+    `第 ${r.publication_seq} 号巡检版 · 第 ${r.seq} 轮 · ${statusText(r.status)} · ` +
+    `${r.filled_count}/${r.region_count} 区 · 隐患 ${r.hazard_count}`);
+  const picked = window.prompt(
+    `该图纸共 ${data.count} 个轮次（最新在前）：\n\n${lines.join('\n')}\n\n` +
+    `输入要打开的轮次 ID（左侧 # 数字即轮次 ID）：`);
+  if (picked && /^\d+$/.test(picked.trim())) {
+    openRound(Number(picked.trim())).catch((err) => toast2(err.message, true, 6000));
+  }
+});
+
+async function apiSend(method, url, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, opts);
+  let data = null;
+  try { data = await res.json(); } catch (_) { /* 无响应体 */ }
+  if (!res.ok) {
+    const err = new Error((data && data.message) || `请求失败：HTTP ${res.status}`);
+    err.status = res.status;
+    err.code = data && data.error;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+/* ----------------------------- 打开 / 退出轮次 ----------------------------- */
+
+async function openRound(roundId) {
+  let data;
+  try {
+    data = await apiGet(`/api/rounds/${roundId}`);
+  } catch (err) {
+    toast2(err.message, true, 6000);
+    throw err;
+  }
+  const round = data.round;
+  // 轮次属于其他发布版时，切到该冻结版（冻结区域与结果才能对齐渲染）
+  if (!state.pub || state.pub.id !== round.publication_id) {
+    if (state.dirty.size &&
+        !confirm('当前轮次有未保存内容，切换巡检版不会自动保存，确定吗？')) return;
+    try {
+      await loadPublication(round.publication_seq);
+    } catch (err) { toast2(err.message, true, 6000); return; }
+    $('inspSeqSelect').value = String(round.publication_seq);
+    const url = new URL(location.href);
+    url.searchParams.set('seq', round.publication_seq);
+    url.searchParams.set('round', round.id);
+    history.replaceState(null, '', url);
+    // loadRounds 由 loadPublication 触发，确保轮次列表已是该版
+  } else {
+    const url = new URL(location.href);
+    url.searchParams.set('round', round.id);
+    history.replaceState(null, '', url);
+  }
+  state.activeRound = round;
+  state.dirty = new Set();
+  setBanner('');
+  renderRoundWorkspace();
+  renderRegions(state.pub);
+  renderRoundsList();
+  startPolling();
+}
+
+function exitRound(updateUrl) {
+  stopPolling();
+  state.activeRound = null;
+  state.dirty = new Set();
+  setBanner('');
+  $('roundWorkspace').classList.add('hidden');
+  if (state.pub) renderRegions(state.pub);
+  renderRoundsList();
+  if (updateUrl) {
+    const url = new URL(location.href);
+    url.searchParams.delete('round');
+    history.replaceState(null, '', url);
+  }
+}
+
+/* ----------------------------- 轮次填写工作区 ----------------------------- */
+
+function renderRoundWorkspace() {
+  const round = state.activeRound;
+  if (!round) return;
+  const ws = $('roundWorkspace');
+  ws.classList.remove('hidden');
+  const closed = round.status === 'completed';
+  $('roundWsTitle').innerHTML =
+    `<strong>第 ${round.seq} 轮巡检</strong>` +
+    `<span class="round-state ${round.status}">${statusText(round.status)}</span>`;
+  $('roundWsBadges').innerHTML = `
+    <span class="badge">巡检版 #${round.publication_seq}</span>
+    <span class="badge">轮次版本 r${round.version}</span>
+    <span class="badge">进度 ${round.filled_count}/${round.region_count}</span>
+    <span class="badge">隐患 ${round.hazard_count}</span>`;
+  $('roundWsStatus').textContent = closed
+    ? `本轮已于 ${round.completed_at || ''} 完成，结果与冻结区域均为只读。`
+    : '每区选择结论后点「保存本区」；保存携带当前轮次版本，他人先修改会收到冲突且不覆盖你的输入。';
+  $('btnCompleteRound').disabled = closed;
+  $('btnCompleteRound').textContent = closed
+    ? '本轮已完成（只读）'
+    : `✓ 完成本轮巡检（${round.filled_count}/${round.region_count}）`;
+  renderEntryList();
+  ws.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function renderEntryList() {
+  const round = state.activeRound;
+  const ul = $('roundEntryList');
+  ul.innerHTML = '';
+  const closed = round.status === 'completed';
+  for (const r of round.regions) {
+    // 未保存的本地输入优先于服务端值：轮询/他人更新触发重渲染时绝不覆盖用户正在填写的内容
+    const isDirty = state.dirty.has(r.code);
+    const picked = isDirty && r.__pick !== undefined ? r.__pick : r.result;
+    const noteVal = isDirty && r.__note !== undefined ? r.__note : (r.note || '');
+    const li = document.createElement('li');
+    li.dataset.code = r.code;
+    li.innerHTML = `
+      <div class="entry-head">
+        <span class="risk-dot ${esc(r.risk_level)}"></span>
+        <span class="r-code">${esc(r.code)}</span>
+        <span class="muted">${esc(r.risk_level)}</span>
+        <span class="entry-state" data-role="state"></span>
+      </div>
+      <div class="entry-controls" data-role="controls"></div>`;
+    const controls = li.querySelector('[data-role=controls]');
+    const stateEl = li.querySelector('[data-role=state]');
+
+    const seg = document.createElement('div');
+    seg.className = 'seg';
+    for (const val of ['正常', '隐患']) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'seg-btn' + (picked === val ? ' on result-' + val : '');
+      b.textContent = val;
+      b.disabled = closed;
+      b.onclick = () => {
+        r.__pick = val;
+        markDirty(r.code);
+        paintEntry(li, r, val);
+      };
+      seg.appendChild(b);
+    }
+    controls.appendChild(seg);
+
+    const note = document.createElement('textarea');
+    note.className = 'entry-note';
+    note.rows = 2;
+    note.maxLength = 2000;
+    note.placeholder = picked === '隐患' ? '隐患描述（必填）' : '备注（可选）';
+    note.value = noteVal;
+    note.disabled = closed;
+    note.oninput = () => {
+      r.__note = note.value;
+      markDirty(r.code);
+      paintEntry(li, r, r.__pick !== undefined ? r.__pick : r.result, note);
+    };
+    controls.appendChild(note);
+
+    const actions = document.createElement('div');
+    actions.className = 'entry-actions';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn btn-sm primary';
+    saveBtn.textContent = '保存本区';
+    saveBtn.disabled = closed;
+    saveBtn.onclick = () => saveEntry(r.code, li);
+    const savedAt = document.createElement('span');
+    savedAt.className = 'muted entry-saved';
+    savedAt.textContent = r.updated_at ? `已保存 ${r.updated_at}` : '未保存';
+    actions.append(saveBtn, savedAt);
+    controls.appendChild(actions);
+
+    ul.appendChild(li);
+    paintEntry(li, r, picked, note, stateEl);
+  }
+}
+
+function paintEntry(li, r, picked, noteEl, stateEl) {
+  const note = noteEl || li.querySelector('.entry-note');
+  const st = stateEl || li.querySelector('[data-role=state]');
+  const cur = picked || r.result;
+  li.classList.toggle('is-hazard', cur === '隐患');
+  li.classList.toggle('is-ok', cur === '正常');
+  li.querySelectorAll('.seg-btn').forEach((b) => {
+    b.classList.toggle('on', b.textContent === cur);
+    b.classList.toggle('result-正常', b.textContent === '正常' && b.textContent === cur);
+    b.classList.toggle('result-隐患', b.textContent === '隐患' && b.textContent === cur);
+  });
+  if (state.dirty.has(r.code)) {
+    st.textContent = '● 未保存';
+    st.className = 'entry-state unsaved';
+  } else if (r.result) {
+    st.textContent = `✓ ${r.result}`;
+    st.className = 'entry-state saved result-' + r.result;
+  } else {
+    st.textContent = '待填写';
+    st.className = 'entry-state muted2';
+  }
+}
+
+function markDirty(code) {
+  state.dirty.add(code);
+  renderRoundsList();
+  const btn = $('btnCompleteRound');
+  if (!btn.disabled) {
+    btn.textContent = `✓ 完成本轮巡检（${state.activeRound.filled_count}/${state.activeRound.region_count}，有未保存内容）`;
+  }
+}
+
+async function saveEntry(code, li) {
+  const round = state.activeRound;
+  if (!round || round.status === 'completed' || state.busy) return;
+  const rec = round.regions.find((x) => x.code === code);
+  const result = rec.__pick || rec.result;
+  const note = (rec.__note !== undefined ? rec.__note : rec.note) || '';
+  if (!result) { toast2(`区域「${code}」请先选择结论（正常/隐患）`, true); return; }
+  if (result === '隐患' && !note.trim()) {
+    toast2(`区域「${code}」结论为隐患，必须填写非空备注`, true, 5000);
+    li.classList.add('entry-invalid');
+    setTimeout(() => li.classList.remove('entry-invalid'), 1600);
+    return;
+  }
+  state.busy = true;
+  try {
+    const data = await apiSend('PUT', `/api/rounds/${round.id}/records`, {
+      region_code: code, result, note: note.trim(), version: round.version,
+    });
+    state.activeRound = data.round;
+    state.dirty.delete(code);
+    renderRoundWorkspace();
+    renderRegions(state.pub);
+    renderRoundsList();
+    toast2(`区域「${code}」已保存（${result}）`);
+  } catch (err) {
+    handleRoundError(err, code);
+  } finally {
+    state.busy = false;
+  }
+}
+
+$('btnCompleteRound').addEventListener('click', async () => {
+  const round = state.activeRound;
+  if (!round || round.status === 'completed' || state.busy) return;
+  if (state.dirty.size) {
+    toast2(`还有 ${state.dirty.size} 个区域改了但未保存，请先逐区保存再完成`, true, 5000);
+    return;
+  }
+  const missing = round.regions.filter((r) => !r.result).map((r) => r.code);
+  if (missing.length) {
+    toast2(`仍有 ${missing.length} 个区域未填写：${missing.slice(0, 5).join('、')}`, true, 5000);
+    return;
+  }
+  if (!confirm(`将完成第 ${round.seq} 轮巡检（${round.region_count} 区，隐患 ${round.hazard_count} 处）。\n完成后轮次与结果只读，确定吗？`)) {
+    return;
+  }
+  state.busy = true;
+  try {
+    const data = await apiSend('POST', `/api/rounds/${round.id}/complete`,
+      { version: round.version });
+    state.activeRound = data.round;
+    state.dirty = new Set();
+    renderRoundWorkspace();
+    renderRegions(state.pub);
+    renderRoundsList();
+    setBanner('');
+    toast2(data.message || '本轮巡检已完成，结果已锁定为只读', false, 5000);
+    stopPolling();
+  } catch (err) {
+    handleRoundError(err);
+  } finally {
+    state.busy = false;
+  }
+});
+
+/**
+ * 冲突/状态错误统一处理：
+ *  - 409 ROUND_VERSION_CONFLICT / ROUND_INCOMPLETE / ROUND_CLOSED：
+ *    用服务器最新状态同步其他区域，用户正在填写（dirty）的内容原样保留；
+ *  - 404 UNKNOWN_REGION / 400 校验错误：提示，不写任何内容。
+ */
+function handleRoundError(err, code) {
+  const serverRound = err.data && err.data.server && err.data.server.round;
+  if (err.status === 409 && serverRound) {
+    const wasClosed = serverRound.status === 'completed';
+    // 用服务端最新状态整体替换，但 dirty 区的本地输入（__pick/__note）原样带回，不覆盖
+    state.activeRound = mergeServerRound(state.activeRound, serverRound);
+    renderRoundWorkspace();
+    renderRegions(state.pub);
+    renderRoundsList();
+    const actions = code
+      ? `<button class="btn btn-sm" id="bannerReload">用他人结果覆盖本区（将放弃未保存输入）</button>` : '';
+    setBanner(`<strong>${err.code === 'ROUND_CLOSED' ? '轮次已关闭' : '版本冲突 / 无法完成'}</strong><br>${esc(err.message)}`,
+      true, actions);
+    const rb = $('bannerReload');
+    if (rb) {
+      rb.onclick = () => {
+        state.dirty.delete(code);
+        const local = state.activeRound.regions.find((x) => x.code === code);
+        if (local) { delete local.__pick; delete local.__note; }
+        renderRoundWorkspace();
+        renderRegions(state.pub);
+        setBanner('');
+      };
+    }
+    if (wasClosed) stopPolling();
+  } else {
+    toast2(err.message, true, 6000);
+  }
+}
+
+/** 用服务端最新轮次更新状态，但把 dirty 区的本地输入暂存回新对象 */
+function mergeServerRound(oldRound, serverRound) {
+  if (!oldRound) return serverRound;
+  for (const nr of serverRound.regions) {
+    const local = oldRound.regions.find((x) => x.code === nr.code);
+    if (local && state.dirty.has(nr.code)) {
+      nr.__pick = local.__pick;
+      nr.__note = local.__note;
+    }
+  }
+  return serverRound;
+}
+
+/* ------------------------------- 轻量轮询 ------------------------------- */
+
+function startPolling() {
+  stopPolling();
+  state.pollTimer = setInterval(() => {
+    if (!state.activeRound || state.busy) return;
+    if (document.visibilityState === 'hidden') return;
+    refreshActiveRound();
+  }, 4000);
+}
+function stopPolling() {
+  if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+}
+
+async function refreshActiveRound() {
+  const cur = state.activeRound;
+  if (!cur) return;
+  let data;
+  try {
+    data = await apiGet(`/api/rounds/${cur.id}`);
+  } catch (_) { return; }
+  const srv = data.round;
+  if (srv.version === cur.version && srv.status === cur.status) return;
+  state.activeRound = mergeServerRound(cur, srv);
+  renderRoundWorkspace();
+  renderRegions(state.pub);
+  renderRoundsList();
+  if (srv.status === 'completed' && cur.status !== 'completed') {
+    stopPolling();
+    toast2('本轮巡检已被他人完成，结果已锁定为只读', false, 5000);
+  } else if (state.dirty.size === 0) {
+    setBanner('');
+  }
+}
+
+window.addEventListener('beforeunload', (e) => {
+  if (state.dirty.size) { e.preventDefault(); e.returnValue = ''; }
+});
 
 init();
