@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>巡检轮次 · 展馆平面图协作标注</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="inspector-body">
+  <header class="topbar inspector-topbar">
+    <div class="brand">
+      <span class="logo">▱</span> 巡检轮次
+      <span class="tagline" id="rdTagline">按发布版冻结的区域编号逐区填写 · 完成后轮次只读</span>
+    </div>
+    <div class="top-actions" id="rdActions"></div>
+  </header>
+
+  <main id="rdMain" class="inspector-main">
+    <aside class="panel inspector-panel">
+      <div class="panel-section">
+        <a class="btn link" id="rdBack" href="#">← 返回巡检版页面</a>
+        <h2 id="rdTitle">加载中…</h2>
+        <div class="meta-row" id="rdBadges"></div>
+        <div id="rdProgressWrap" class="round-progress-wrap"></div>
+      </div>
+
+      <div class="panel-section" id="rdEditingSection">
+        <h3>逐区填写</h3>
+        <p class="hint">每个区域选择「正常 / 隐患」；选「隐患」时备注必填。逐区保存均带轮次版本号，他人先修改会提示冲突，不会覆盖你未提交的内容。</p>
+        <div id="rdValidate" class="validate-msg"></div>
+        <div class="btn-row" style="margin-top:8px">
+          <button class="btn" id="btnRefreshRound">刷新最新状态</button>
+          <button class="btn primary" id="btnCompleteRound">完成本轮巡检</button>
+        </div>
+      </div>
+
+      <div class="panel-section" id="rdDoneSection" hidden>
+        <div class="round-done-box">
+          <strong>✅ 本轮巡检已完成</strong>
+          <p class="muted" id="rdDoneText"></p>
+          <p class="hint">完成后的轮次与结果只读；后续图纸改名、换图、区域编辑或重新发布都不会改变本页冻结的区域与结果。</p>
+          <button class="btn" id="btnRefreshDone">刷新查看</button>
+        </div>
+      </div>
+
+      <div class="panel-section grow">
+        <h3>区域结果 <span id="rdCount" class="muted"></span></h3>
+        <ul id="rdRegionList" class="round-cards"></ul>
+      </div>
+    </aside>
+
+    <div class="canvas-wrap" id="rdCanvasWrap">
+      <svg id="rdSvg" xmlns="http://www.w3.org/2000/svg">
+        <g id="rdViewport">
+          <rect id="rdBg" x="0" y="0" fill="#ffffff"></rect>
+          <image id="rdImage" x="0" y="0"></image>
+          <g id="rdRegionLayer"></g>
+        </g>
+      </svg>
+      <div class="canvas-status">
+        <span id="rdZoomLevel"></span>
+        <span id="rdStatus"></span>
+      </div>
+      <div id="rdEmpty" class="inspector-empty hidden">
+        <div class="empty-box">
+          <h2 id="rdEmptyTitle">轮次无法显示</h2>
+          <p class="muted" id="rdEmptyText"></p>
+          <a class="btn primary" href="/">返回应用首页</a>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <div id="toasts" class="toasts"></div>
+  <script src="/round.js"></script>
+</body>
+</html>

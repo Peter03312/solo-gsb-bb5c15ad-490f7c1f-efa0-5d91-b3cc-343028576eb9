@@ -19,6 +19,7 @@ const state = {
   currentSeq: null,
   latestSeq: null,
   pub: null,
+  rounds: [],
   transform: { scale: 1, tx: 0, ty: 0 },
   drag: null,
 };
@@ -74,6 +75,7 @@ async function init() {
 
   buildSwitcher(list);
 
+  $('inspRoundsSection').classList.toggle('hidden', list.count === 0);
   if (!list.count) {
     $('inspTitle').textContent = list.plan_name || '图纸';
     showEmpty(`图纸「${list.plan_name}」还没有发布过巡检版。`, false);
@@ -148,7 +150,129 @@ async function loadPublication(seq) {
   renderImage(pub);
   renderRegions(pub);
   renderRegionList(pub);
+  loadRounds(pub.seq);
   fitView();
+}
+
+/* ------------------------------ 巡检轮次 ------------------------------ */
+
+async function loadRounds(seq) {
+  const section = $('inspRoundsSection');
+  const startBtn = $('btnStartRound');
+  const list = $('inspRoundList');
+  const empty = $('inspRoundEmpty');
+  list.innerHTML = '';
+  empty.textContent = '';
+  startBtn.disabled = true;
+  startBtn.textContent = '▶ 发起新一轮巡检';
+
+  let data;
+  try {
+    data = await apiGet(`/api/plans/${planId}/publications/${seq}/rounds`);
+  } catch (err) {
+    empty.textContent = '轮次列表加载失败：' + err.message;
+    section.dataset.hasRegions = '';
+    startBtn.disabled = true;
+    return;
+  }
+  state.rounds = data.rounds;
+  const hasRegions = (data.publication.region_count || 0) > 0;
+  section.dataset.hasRegions = hasRegions ? '1' : '';
+
+  startBtn.disabled = !hasRegions;
+  startBtn.title = hasRegions
+    ? `基于第 ${seq} 号发布版冻结的 ${data.publication.region_count} 个区域发起一轮巡检`
+    : '该发布版没有任何区域，无法发起巡检';
+
+  if (!hasRegions) {
+    empty.textContent = `第 ${seq} 号发布版不含区域，不能发起巡检。`;
+  } else if (!data.rounds.length) {
+    empty.textContent = `本版尚无巡检轮次，点击上方按钮发起第 1 轮。`;
+  }
+  $('inspRoundCount').textContent = `（${data.rounds.length}）`;
+
+  for (const rd of data.rounds) {
+    const li = document.createElement('li');
+    const total = rd.region_count;
+    const pct = total ? Math.round(rd.filled_count / total * 100) : 0;
+    const done = rd.status === 'completed';
+    li.className = 'round-history-item' + (done ? ' done' : ' live');
+    li.innerHTML = `
+      <div class="round-history-head">
+        <span class="round-seq">第 ${rd.seq} 轮</span>
+        <span class="round-status-tag">${done ? '✅ 已完成' : '🚧 进行中'}</span>
+      </div>
+      <div class="round-progress-text muted">
+        进度 ${rd.filled_count}/${total}（${pct}%）· 正常 ${rd.normal_count} · 隐患 ${rd.hazard_count}
+      </div>
+      <div class="round-progress-bar mini"><div class="round-progress-inner" style="width:${pct}%"></div></div>
+      <div class="round-history-foot muted">
+        ${done ? '完成于 ' + esc(rd.completed_at || '') : '发起于 ' + esc(rd.created_at || '')}
+        <span class="round-history-actions"></span>
+      </div>`;
+    const openBtn = document.createElement('a');
+    openBtn.className = 'btn';
+    openBtn.textContent = done ? '查看结果' : '继续填写';
+    openBtn.href = `/round.html?plan=${planId}&round=${rd.id}`;
+    openBtn.target = '_blank';
+    openBtn.rel = 'noopener';
+    li.querySelector('.round-history-actions').appendChild(openBtn);
+    list.appendChild(li);
+  }
+}
+
+$('btnStartRound').addEventListener('click', async () => {
+  const seq = state.currentSeq;
+  if (!seq) return;
+  const btn = $('btnStartRound');
+  btn.disabled = true;
+  try {
+    const res = await apiPost(`/api/plans/${planId}/publications/${seq}/rounds`, {});
+    toast(`已发起第 ${res.round.seq} 轮巡检`, true);
+    window.open(`/round.html?plan=${planId}&round=${res.round.id}`, '_blank', 'noopener');
+    await loadRounds(seq);
+  } catch (err) {
+    btn.disabled = false;
+    if (err.code === 'PUBLICATION_HAS_NO_REGIONS') {
+      toast(err.message, false);
+    } else {
+      toast('发起巡检失败：' + err.message, false);
+    }
+  }
+});
+
+async function apiPost(url, body) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  let data = null;
+  try { data = await res.json(); } catch (_) { /* 无响应体 */ }
+  if (!res.ok) {
+    const err = new Error((data && data.message) || `请求失败：HTTP ${res.status}`);
+    err.status = res.status;
+    err.code = data && data.error;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+function toast(message, ok) {
+  let el = document.getElementById('inspToast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'inspToast';
+    el.className = 'toast ' + (ok ? 'ok' : 'err');
+    document.body.appendChild(el);
+  } else {
+    el.className = 'toast ' + (ok ? 'ok' : 'err');
+  }
+  el.textContent = message;
+  el.style.opacity = '1';
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.style.opacity = '0'; }, 3200);
 }
 
 function renderImage(pub) {

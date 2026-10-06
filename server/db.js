@@ -73,6 +73,43 @@ function openDb() {
     -- 序号在图纸内唯一（并用 seq DESC 取最新版）
     CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_plan_seq
       ON publications(plan_id, seq);
+
+    -- 巡检轮次：针对某个已发布巡检版发起的一轮巡检；完成后只读、永不改变
+    CREATE TABLE IF NOT EXISTS inspection_rounds (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      plan_id         INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+      publication_id  INTEGER NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
+      seq             INTEGER NOT NULL,          -- 轮次序号：同一巡检版内从 1 递增
+      publication_seq INTEGER NOT NULL,          -- 冗余冻结：所属发布序号，发布记录不受影响也便于列表
+      plan_name       TEXT    NOT NULL,          -- 冗余冻结：发起时巡检版冻结的图纸名
+      status          TEXT    NOT NULL DEFAULT 'in_progress', -- in_progress | completed
+      version         INTEGER NOT NULL DEFAULT 1, -- 轮次乐观锁版本：每次记录写入 +1，完成再 +1
+      inspector       TEXT    NOT NULL DEFAULT '',
+      created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+      updated_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+      completed_at    TEXT
+    );
+
+    -- 轮次序号在同一巡检版内唯一
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_rounds_pub_seq
+      ON inspection_rounds(publication_id, seq);
+
+    CREATE INDEX IF NOT EXISTS idx_rounds_plan
+      ON inspection_rounds(plan_id, id);
+
+    -- 逐区巡检结果：按「轮次 + 冻结区域编号」唯一；只有发起轮次时版本里的编号可写入
+    CREATE TABLE IF NOT EXISTS inspection_results (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      round_id    INTEGER NOT NULL REFERENCES inspection_rounds(id) ON DELETE CASCADE,
+      code        TEXT    NOT NULL,          -- 冻结区域编号（快照 regions_json 中的 code）
+      conclusion  TEXT    NOT NULL,          -- 正常 | 隐患
+      remark      TEXT    NOT NULL DEFAULT '',
+      created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+      updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_results_round_code
+      ON inspection_results(round_id, code);
   `);
 
   return db;

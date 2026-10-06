@@ -33,6 +33,14 @@
         <p class="hint" id="inspSwitchHint"></p>
       </div>
 
+      <div class="panel-section" id="inspRoundsSection">
+        <h3>巡检轮次 <span id="inspRoundCount" class="muted"></span></h3>
+        <p class="hint">基于当前发布版冻结的区域编号发起巡检，逐区填写「正常 / 隐患」；同一发布版可开展多轮，完成后该轮只读。</p>
+        <button class="btn primary wide" id="btnStartRound" style="margin-top:8px">▶ 发起新一轮巡检</button>
+        <p class="pub-empty" id="inspRoundEmpty"></p>
+        <ul class="round-history" id="inspRoundList"></ul>
+      </div>
+
       <div class="panel-section grow">
         <h3>区域清单（只读） <span id="inspCount" class="muted"></span></h3>
         <ul id="inspRegionList" class="region-list"></ul>
