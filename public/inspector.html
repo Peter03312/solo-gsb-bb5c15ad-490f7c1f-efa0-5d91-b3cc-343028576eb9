@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>巡检版（只读） · 展馆平面图协作标注</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="inspector-body">
+  <header class="topbar inspector-topbar">
+    <div class="brand">
+      <span class="logo">▱</span> 只读巡检版
+      <span class="tagline">已发布快照 · 编号 / 风险等级 / 原图坐标固定，不受后续编辑影响</span>
+    </div>
+    <div class="top-actions" id="inspActions"></div>
+  </header>
+
+  <main id="inspMain" class="inspector-main">
+    <aside class="panel inspector-panel">
+      <div class="panel-section">
+        <h2 id="inspTitle">加载中…</h2>
+        <div class="meta-row" id="inspBadges"></div>
+      </div>
+
+      <div class="panel-section inspector-switch">
+        <label>查看发布版本
+          <select id="inspSeqSelect"></select>
+        </label>
+        <div class="btn-row">
+          <a class="btn" id="inspLatestLink" href="#">查看最新版</a>
+          <a class="btn" id="inspApiLink" href="#" target="_blank" rel="noopener">本版 JSON</a>
+        </div>
+        <p class="hint" id="inspSwitchHint"></p>
+      </div>
+
+      <div class="panel-section grow">
+        <h3>区域清单（只读） <span id="inspCount" class="muted"></span></h3>
+        <ul id="inspRegionList" class="region-list"></ul>
+      </div>
+
+      <div class="panel-section">
+        <p class="hint">巡检页仅展示发布时冻结的内容；无任何编辑、删除入口。</p>
+        <a class="btn wide" href="/">← 返回应用首页</a>
+      </div>
+    </aside>
+
+    <div class="canvas-wrap" id="inspCanvasWrap">
+      <svg id="inspSvg" xmlns="http://www.w3.org/2000/svg">
+        <g id="inspViewport">
+          <rect id="inspBg" x="0" y="0" fill="#ffffff"></rect>
+          <image id="inspImage" x="0" y="0"></image>
+          <g id="inspRegionLayer"></g>
+        </g>
+      </svg>
+      <div class="canvas-status">
+        <span id="inspZoomLevel"></span>
+        <span id="inspSeqStatus"></span>
+      </div>
+      <div id="inspEmpty" class="inspector-empty hidden">
+        <div class="empty-box">
+          <h2>暂无巡检版</h2>
+          <p class="muted" id="inspEmptyText">该图纸还没有发布过巡检版。</p>
+          <p class="muted">请由编辑人员在图纸页面点击「发布巡检版」后再发给巡检人员。</p>
+          <a class="btn primary" href="/">返回应用首页</a>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script src="/inspector.js"></script>
+</body>
+</html>
